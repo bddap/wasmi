@@ -278,7 +278,7 @@ fn resume_call_host_func() {
 	let func_instance = export.as_func().unwrap();
 
 	let mut invocation = FuncInstance::invoke_resumable(&func_instance, &[]).unwrap();
-	let result = invocation.start_execution(&mut env);
+	let result = invocation.start_execution(&mut env, &func_instance, &[]);
 	match result {
 		Err(ResumableError::Trap(_)) => {},
 		_ => panic!(),

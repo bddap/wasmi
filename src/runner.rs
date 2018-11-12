@@ -69,52 +69,64 @@ enum RunResult {
 pub struct Interpreter {
     value_stack: ValueStack,
     call_stack: BoundedStack<FunctionContext>,
-    return_type: Option<ValueType>,
     state: InterpreterState,
 }
 
 impl Interpreter {
-    pub fn new(func: &FuncRef, args: &[RuntimeValue]) -> Result<Interpreter, Trap> {
-        let mut value_stack = ValueStack::new(DEFAULT_VALUE_STACK_LIMIT, DEFAULT_VALUE_STACK_LIMIT);
-        for arg in args {
-            value_stack.push(*arg).map_err(
-                // There is not enough space for pushing initial arguments.
-                // Weird, but bail out anyway.
-                |_| Trap::from(TrapKind::StackOverflow),
-            )?;
-        }
-
-        let mut call_stack = BoundedStack::new(DEFAULT_CALL_STACK_LIMIT, DEFAULT_CALL_STACK_LIMIT);
-        let initial_frame = FunctionContext::new(func.clone());
-        call_stack
-            .push(initial_frame)
-            .map_err(|_| TrapKind::StackOverflow)?;
-
-        let return_type = func.signature().return_type();
-
-        Ok(Interpreter {
-            value_stack,
+    pub fn new(
+        value_stack: BoundedStack<RuntimeValue>,
+        call_stack: BoundedStack<FunctionContext>,
+    ) -> Interpreter {
+        Interpreter {
+            value_stack: ValueStack::new(value_stack),
             call_stack,
-            return_type,
             state: InterpreterState::Initialized,
-        })
+        }
     }
 
     pub fn state(&self) -> &InterpreterState {
         &self.state
     }
 
-    pub fn start_execution<'a, E: Externals + 'a>(
+    pub fn start_execution<E: Externals>(
         &mut self,
-        externals: &'a mut E,
+        externals: &mut E,
+        func: &FuncRef,
+        args: &[RuntimeValue],
     ) -> Result<Option<RuntimeValue>, Trap> {
         // Ensure that the VM has not been executed. This is checked in `FuncInvocation::start_execution`.
         assert!(self.state == InterpreterState::Initialized);
 
+        // Add initial args to value stack
+        for arg in args {
+            self.value_stack
+                .push(*arg)
+                .map_err(|_| TrapKind::StackOverflow)?;
+        }
+
+        // Add initial frame to call stack
+        self.call_stack
+            .push(FunctionContext::new(func.clone()))
+            .map_err(|_| TrapKind::StackOverflow)?;
+
         self.state = InterpreterState::Started;
         self.run_interpreter_loop(externals)?;
 
-        let opt_return_value = self.return_type.map(|_vt| self.value_stack.pop());
+        debug_assert!({
+            // This assertion does not catch all incorrect invocations.
+            // resume_execution has no way to check return type because it doesn't take
+            // func as an argument.
+            match func.signature().return_type() {
+                Some(_) => self.value_stack.len() == 1,
+                None => self.value_stack.len() == 0,
+            }
+        });
+
+        let opt_return_value = if self.value_stack.len() > 0 {
+            Some(self.value_stack.pop())
+        } else {
+            None
+        };
 
         // Ensure that stack is empty after the execution. This is guaranteed by the validation properties.
         assert!(self.value_stack.len() == 0);
@@ -122,10 +134,10 @@ impl Interpreter {
         Ok(opt_return_value)
     }
 
-    pub fn resume_execution<'a, E: Externals + 'a>(
+    pub fn resume_execution<E: Externals>(
         &mut self,
         return_val: Option<RuntimeValue>,
-        externals: &'a mut E,
+        externals: &mut E,
     ) -> Result<Option<RuntimeValue>, Trap> {
         use std::mem::swap;
 
@@ -150,7 +162,11 @@ impl Interpreter {
 
         self.run_interpreter_loop(externals)?;
 
-        let opt_return_value = self.return_type.map(|_vt| self.value_stack.pop());
+        let opt_return_value = if self.value_stack.len() > 0 {
+            Some(self.value_stack.pop())
+        } else {
+            None
+        };
 
         // Ensure that stack is empty after the execution. This is guaranteed by the validation properties.
         assert!(self.value_stack.len() == 0);
@@ -203,7 +219,9 @@ impl Interpreter {
                         }
                         FuncInstanceInternal::Host { ref signature, .. } => {
                             // We push the function context first. If the VM is not resumable, it does no harm. If it is, we then save the context here.
-                            self.call_stack.push(function_context).map_err(|_| TrapKind::StackOverflow)?;
+                            self.call_stack
+                                .push(function_context)
+                                .map_err(|_| TrapKind::StackOverflow)?;
                             let args = prepare_function_args(signature, &mut self.value_stack);
 
                             let return_val =
@@ -1158,15 +1176,15 @@ impl Interpreter {
 }
 
 /// Function execution context.
-struct FunctionContext {
+pub struct FunctionContext {
     /// Is context initialized.
-    pub is_initialized: bool,
+    is_initialized: bool,
     /// Internal function reference.
-    pub function: FuncRef,
-    pub module: ModuleRef,
-    pub memory: Option<MemoryRef>,
+    function: FuncRef,
+    module: ModuleRef,
+    memory: Option<MemoryRef>,
     /// Current instruction position.
-    pub position: u32,
+    position: u32,
 }
 
 impl FunctionContext {
@@ -1279,15 +1297,13 @@ pub fn check_function_args(signature: &Signature, args: &[RuntimeValue]) -> Resu
 }
 
 #[derive(Debug)]
-struct ValueStack {
+pub struct ValueStack {
     stack: BoundedStack<RuntimeValue>,
 }
 
 impl ValueStack {
-    fn new(initial_size: usize, limit: usize) -> ValueStack {
-        ValueStack {
-            stack: BoundedStack::new(initial_size, limit),
-        }
+    fn new(stack: BoundedStack<RuntimeValue>) -> ValueStack {
+        ValueStack { stack }
     }
 
     #[inline]
@@ -1382,13 +1398,13 @@ impl ValueStack {
 struct StackOverflow;
 
 #[derive(Debug)]
-struct BoundedStack<T> {
+pub struct BoundedStack<T> {
     stack: Vec<T>,
     limit: usize,
 }
 
 impl<T> BoundedStack<T> {
-    fn new(initial_size: usize, limit: usize) -> BoundedStack<T> {
+    pub fn new(initial_size: usize, limit: usize) -> BoundedStack<T> {
         debug_assert!(
             limit >= initial_size,
             "Tried to allocate a larger stack than is useable."

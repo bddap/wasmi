@@ -68,7 +68,7 @@ enum RunResult {
 /// Function interpreter.
 pub struct Interpreter {
     value_stack: ValueStack,
-    call_stack: Vec<FunctionContext>,
+    call_stack: BoundedStack<FunctionContext>,
     return_type: Option<ValueType>,
     state: InterpreterState,
 }
@@ -84,9 +84,11 @@ impl Interpreter {
             )?;
         }
 
-        let mut call_stack = Vec::new();
+        let mut call_stack = BoundedStack::new(DEFAULT_CALL_STACK_LIMIT, DEFAULT_CALL_STACK_LIMIT);
         let initial_frame = FunctionContext::new(func.clone());
-        call_stack.push(initial_frame);
+        call_stack
+            .push(initial_frame)
+            .map_err(|_| TrapKind::StackOverflow)?;
 
         let return_type = func.signature().return_type();
 
@@ -182,27 +184,27 @@ impl Interpreter {
 
             match function_return {
                 RunResult::Return => {
-                    if self.call_stack.last().is_none() {
+                    if self.call_stack.top().is_none() {
                         // This was the last frame in the call stack. This means we
                         // are done executing.
                         return Ok(());
                     }
                 }
                 RunResult::NestedCall(nested_func) => {
-                    if self.call_stack.len() + 1 >= DEFAULT_CALL_STACK_LIMIT {
-                        return Err(TrapKind::StackOverflow.into());
-                    }
-
                     match *nested_func.as_internal() {
                         FuncInstanceInternal::Internal { .. } => {
                             let nested_context = FunctionContext::new(nested_func.clone());
-                            self.call_stack.push(function_context);
-                            self.call_stack.push(nested_context);
+                            self.call_stack
+                                .push(function_context)
+                                .map_err(|_| TrapKind::StackOverflow)?;
+                            self.call_stack
+                                .push(nested_context)
+                                .map_err(|_| TrapKind::StackOverflow)?;
                         }
                         FuncInstanceInternal::Host { ref signature, .. } => {
-                            let args = prepare_function_args(signature, &mut self.value_stack);
                             // We push the function context first. If the VM is not resumable, it does no harm. If it is, we then save the context here.
-                            self.call_stack.push(function_context);
+                            self.call_stack.push(function_context).map_err(|_| TrapKind::StackOverflow)?;
+                            let args = prepare_function_args(signature, &mut self.value_stack);
 
                             let return_val =
                                 match FuncInstance::invoke(&nested_func, &args, externals) {
@@ -225,7 +227,7 @@ impl Interpreter {
                             }
 
                             if let Some(return_val) = return_val {
-                                self.value_stack.push(return_val).map_err(Trap::new)?;
+                                self.value_stack.push(return_val)?;
                             }
                         }
                     }
@@ -1355,7 +1357,7 @@ impl ValueStack {
 
     #[inline]
     fn push(&mut self, value: RuntimeValue) -> Result<(), TrapKind> {
-        self.stack.push(value).map_err(|a| a.into())
+        self.stack.push(value).map_err(|_| TrapKind::StackOverflow)
     }
 
     #[inline]
@@ -1378,12 +1380,6 @@ impl ValueStack {
 }
 
 struct StackOverflow;
-
-impl Into<TrapKind> for StackOverflow {
-    fn into(self) -> TrapKind {
-        TrapKind::StackOverflow
-    }
-}
 
 #[derive(Debug)]
 struct BoundedStack<T> {

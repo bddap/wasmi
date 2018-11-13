@@ -3,8 +3,8 @@ use isa;
 use module::ModuleInstance;
 use parity_wasm::elements::Local;
 use runner::{
-    check_function_args, BoundedStack, Interpreter, InterpreterState, DEFAULT_CALL_STACK_LIMIT,
-    DEFAULT_VALUE_STACK_LIMIT,
+    check_function_args, BoundedStack, FunctionContext, Interpreter, InterpreterState,
+    DEFAULT_CALL_STACK_LIMIT, DEFAULT_VALUE_STACK_LIMIT,
 };
 use std::fmt;
 use std::rc::{Rc, Weak};
@@ -138,13 +138,37 @@ impl FuncInstance {
         args: &[RuntimeValue],
         externals: &mut E,
     ) -> Result<Option<RuntimeValue>, Trap> {
+        Self::invoke_configurable(
+            func,
+            args,
+            externals,
+            BoundedStack::new(DEFAULT_VALUE_STACK_LIMIT, DEFAULT_CALL_STACK_LIMIT),
+            BoundedStack::new(DEFAULT_CALL_STACK_LIMIT, DEFAULT_CALL_STACK_LIMIT),
+        )
+    }
+
+    /// Invoke this function with extra configuration parameters.
+    ///
+    /// This is an experimental API
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `args` types is not match function [`signature`] or
+    /// if [`Trap`] at execution time occured.
+    ///
+    /// [`signature`]: #method.signature
+    /// [`Trap`]: #enum.Trap.html
+    pub fn invoke_configurable<E: Externals>(
+        func: &FuncRef,
+        args: &[RuntimeValue],
+        externals: &mut E,
+        value_stack: BoundedStack<RuntimeValue>,
+        call_stack: BoundedStack<FunctionContext>,
+    ) -> Result<Option<RuntimeValue>, Trap> {
         check_function_args(func.signature(), &args).map_err(|_| TrapKind::UnexpectedSignature)?;
         match *func.as_internal() {
             FuncInstanceInternal::Internal { .. } => {
-                let mut interpreter = Interpreter::new(
-                    BoundedStack::new(DEFAULT_VALUE_STACK_LIMIT, DEFAULT_CALL_STACK_LIMIT),
-                    BoundedStack::new(DEFAULT_CALL_STACK_LIMIT, DEFAULT_CALL_STACK_LIMIT),
-                );
+                let mut interpreter = Interpreter::new(value_stack, call_stack);
                 interpreter.start_execution(externals, func, args)
             }
             FuncInstanceInternal::Host {

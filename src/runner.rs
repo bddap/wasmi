@@ -210,18 +210,12 @@ impl Interpreter {
                     match *nested_func.as_internal() {
                         FuncInstanceInternal::Internal { .. } => {
                             let nested_context = FunctionContext::new(nested_func.clone());
-                            self.call_stack
-                                .push(function_context)
-                                .map_err(|_| TrapKind::StackOverflow)?;
-                            self.call_stack
-                                .push(nested_context)
-                                .map_err(|_| TrapKind::StackOverflow)?;
+                            self.call_stack.push(function_context)?;
+                            self.call_stack.push(nested_context)?;
                         }
                         FuncInstanceInternal::Host { ref signature, .. } => {
                             // We push the function context first. If the VM is not resumable, it does no harm. If it is, we then save the context here.
-                            self.call_stack
-                                .push(function_context)
-                                .map_err(|_| TrapKind::StackOverflow)?;
+                            self.call_stack.push(function_context)?;
                             let args = prepare_function_args(signature, &mut self.value_stack);
 
                             let return_val =
@@ -703,7 +697,6 @@ impl Interpreter {
         let stack_value: U = v.extend_into();
         self.value_stack
             .push(stack_value.into())
-            .map_err(Into::into)
             .map(|_| InstructionOutcome::RunNextInstruction)
     }
 
@@ -785,7 +778,6 @@ impl Interpreter {
     fn run_const(&mut self, val: RuntimeValue) -> Result<InstructionOutcome, TrapKind> {
         self.value_stack
             .push(val)
-            .map_err(Into::into)
             .map(|_| InstructionOutcome::RunNextInstruction)
     }
 
@@ -1178,13 +1170,13 @@ impl Interpreter {
 /// Function execution context.
 pub struct FunctionContext {
     /// Is context initialized.
-    is_initialized: bool,
+    pub is_initialized: bool,
     /// Internal function reference.
-    function: FuncRef,
-    module: ModuleRef,
-    memory: Option<MemoryRef>,
+    pub function: FuncRef,
+    pub module: ModuleRef,
+    pub memory: Option<MemoryRef>,
     /// Current instruction position.
-    position: u32,
+    pub position: u32,
 }
 
 impl FunctionContext {
@@ -1223,9 +1215,7 @@ impl FunctionContext {
 
         // TODO: Replace with extend.
         for local in locals {
-            value_stack
-                .push(local)
-                .map_err(|_| TrapKind::StackOverflow)?;
+            value_stack.push(local)?;
         }
 
         self.is_initialized = true;
@@ -1397,6 +1387,26 @@ impl ValueStack {
 
 struct StackOverflow;
 
+impl From<StackOverflow> for TrapKind {
+    fn from(_: StackOverflow) -> TrapKind {
+        TrapKind::StackOverflow
+    }
+}
+
+impl From<StackOverflow> for Trap {
+    fn from(_: StackOverflow) -> Trap {
+        Trap::new(TrapKind::StackOverflow)
+    }
+}
+
+/// Stack memory for use by interpreter.
+///
+/// BoundedStack is guaranteed never to grow larger than a set limit.
+/// When limit is reached attempting to push to the stack will return
+/// `Err(StackOverflow)`.
+///
+/// In addition to the limit. Initial stack size is configurable.
+/// `BoundedStack` will start out with initial size, but grow if necessary.
 #[derive(Debug)]
 pub struct BoundedStack<T> {
     stack: Vec<T>,
@@ -1404,17 +1414,25 @@ pub struct BoundedStack<T> {
 }
 
 impl<T> BoundedStack<T> {
+    /// Create an new BoundedStack with `limit` max size and `initial_size` elements pre-allocated
+    /// `initial_size` should not be larger than `limit`
     pub fn new(initial_size: usize, limit: usize) -> BoundedStack<T> {
         debug_assert!(
             limit >= initial_size,
-            "Tried to allocate a larger stack than is useable."
+            "initial_size should not be larger than BoundedStack limit"
         );
+        use std::cmp::min;
         BoundedStack {
             stack: Vec::with_capacity(initial_size),
-            limit,
+            limit: min(initial_size, limit),
         }
     }
 
+    /// Attempt to push value onto stack.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err(StackOverflow) if stack is already full.
     fn push(&mut self, value: T) -> Result<(), StackOverflow> {
         debug_assert!(
             self.stack.len() <= self.limit,
@@ -1455,4 +1473,11 @@ impl<T> BoundedStack<T> {
     fn len(&self) -> usize {
         self.stack.len()
     }
+
+    // /// return a new empty BoundedStack with limit equal to the amount of room
+    // /// this stack has available
+    // fn spare(&self) -> BoundedStack<T> {
+    //     // This will be used to allocate new stacks when calling into other wasm modules
+    //     BoundedStack::new(0, self.limit - self.len())
+    // }
 }

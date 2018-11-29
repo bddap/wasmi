@@ -216,6 +216,62 @@ pub struct Interpreter {
 	state: InterpreterState,
 }
 
+pub enum Invocation<'a, E: 'a + Externals> {
+	Resumable(Resumable<'a, E>),
+	Done {
+		interpreter: Interpreter,
+		result: Result<Option<RuntimeValue>, Trap>,
+	},
+}
+
+impl<'a, E: Externals> Invocation<'a, E> {
+	// Initialize an Invocation based on an interpreter and the result of the interpreter's last
+	// invocation. Return type of the function at the bottom of the call stack must also be
+	// supplied. Externals must also be supplied.
+	fn new(
+		interpreter: Interpreter,
+		result: Result<Option<RuntimeValue>, Trap>,
+		return_type: Option<ValueType>,
+		externals: &'a mut E,
+	) -> Self {
+		match result {
+			Err(Trap {
+				kind: TrapKind::Host(_),
+			}) => Invocation::Resumable(Resumable {
+				interpreter,
+				return_type,
+				externals,
+			}),
+			result => Invocation::Done { interpreter, result },
+		}
+	}
+
+	/// Clear data from interpreter and return it so it can be reused.
+	fn reset(self) -> Interpreter {
+		let mut interpreter = match self {
+			Invocation::Resumable(Resumable { interpreter, .. }) => interpreter,
+			Invocation::Done { interpreter, .. } => interpreter,
+		};
+		interpreter.reset();
+		interpreter
+	}
+}
+
+pub struct Resumable<'a, E: 'a + Externals> {
+	interpreter: Interpreter,
+	return_type: Option<ValueType>,
+	externals: &'a mut E,
+}
+
+impl<'a, E: Externals> Resumable<'a, E> {
+	pub fn resume(mut self, requested_value: Option<RuntimeValue>) -> Invocation<'a, E> {
+		let result = self
+			.interpreter
+			.resume_execution(requested_value, self.externals, self.return_type);
+		Invocation::new(self.interpreter, result, self.return_type, self.externals)
+	}
+}
+
 impl Interpreter {
 	/// Initialize an interpreter with default stack sizes.
 	pub fn new() -> Interpreter {
@@ -300,7 +356,36 @@ impl Interpreter {
 		}
 	}
 
-	pub(crate) fn start_execution<E: Externals>(
+	/// Invoke the `func`, get a resumable handle. This handle can then be used to [`start_execution`]. If a
+	/// Host trap happens, caller can use [`resume_execution`] to feed the expected return value back in, and then
+	/// continue the execution.
+	///
+	/// This is an experimental API, and this functionality may not be available in other WebAssembly engines.
+	///
+	/// # Errors
+	///
+	/// Returns `Err` if `args` types is not match function [`signature`].
+	///
+	/// [`signature`]: #method.signature
+	/// [`Trap`]: #enum.Trap.html
+	/// [`start_execution`]: struct.FuncInvocation.html#method.start_execution
+	/// [`resume_execution`]: struct.FuncInvocation.html#method.resume_execution
+	///
+	/// ```
+	/// assert!(false); // update this documentation
+	/// assert!(false); // add doctest
+	/// ```
+	pub fn invoke_resumable<'a, E: Externals>(
+		mut self,
+		func: &FuncRef,
+		args: &[RuntimeValue],
+		externals: &'a mut E,
+	) -> Invocation<'a, E> {
+		let result = self.invoke(func, args, externals);
+		Invocation::new(self, result, func.signature().return_type(), externals)
+	}
+
+	fn start_execution<E: Externals>(
 		&mut self,
 		func: &FuncRef,
 		args: &[RuntimeValue],
@@ -332,9 +417,9 @@ impl Interpreter {
 		Ok(opt_return_value)
 	}
 
-	pub(crate) fn resume_execution<'a, E: Externals + 'a>(
+	fn resume_execution<'a, E: Externals + 'a>(
 		&mut self,
-		return_val: Option<RuntimeValue>,
+		expected_value: Option<RuntimeValue>,
 		externals: &'a mut E,
 		return_type: Option<ValueType>,
 	) -> Result<Option<RuntimeValue>, Trap> {
@@ -346,8 +431,8 @@ impl Interpreter {
 		let mut resumable_state = InterpreterState::Started;
 		swap(&mut self.state, &mut resumable_state);
 
-		if let Some(return_val) = return_val {
-			self.value_stack.push(return_val.into()).map_err(Trap::new)?;
+		if let Some(expected_value) = expected_value {
+			self.value_stack.push(expected_value.into()).map_err(Trap::new)?;
 		}
 
 		self.run_interpreter_loop(externals)?;

@@ -402,9 +402,9 @@ pub use self::host::{Externals, NopExternals, HostError, RuntimeArgs};
 pub use self::imports::{ModuleImportResolver, ImportResolver, ImportsBuilder};
 pub use self::module::{ModuleInstance, ModuleRef, ExternVal, NotStartedModuleRef};
 pub use self::global::{GlobalInstance, GlobalRef};
-pub use self::func::{FuncInstance, FuncRef, FuncInvocation, ResumableError};
+pub use self::func::{FuncInstance, FuncRef};
 pub use self::types::{Signature, ValueType, GlobalDescriptor, TableDescriptor, MemoryDescriptor};
-pub use self::runner::{Interpreter, InterpreterStackConfig};
+pub use self::runner::{Interpreter, InterpreterStackConfig, Invocation, Resumable};
 
 /// WebAssembly-specific sizes and units.
 pub mod memory_units {

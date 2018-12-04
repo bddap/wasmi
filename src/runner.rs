@@ -132,27 +132,6 @@ pub enum InstructionOutcome {
 	Return(isa::DropKeep),
 }
 
-#[derive(PartialEq, Eq)]
-/// Function execution state, related to pause and resume.
-pub enum InterpreterState {
-	/// The interpreter has been created, but has not been executed.
-	Initialized,
-	/// The interpreter has started execution, and cannot be called again if it exits normally, or no Host traps happened.
-	Started,
-	/// The interpreter has been executed, and returned a Host trap. It can resume execution by providing back a return
-	/// value.
-	Resumable(Option<ValueType>),
-}
-
-impl InterpreterState {
-	pub fn is_resumable(&self) -> bool {
-		match self {
-			&InterpreterState::Resumable(_) => true,
-			_ => false,
-		}
-	}
-}
-
 /// Function run result.
 enum RunResult {
 	/// Function has returned.
@@ -209,19 +188,12 @@ impl Default for InterpreterStackConfig {
 	}
 }
 
-/// Function interpreter.
-pub struct Interpreter {
-	value_stack: ValueStack,
-	call_stack: StackWithLimit<FunctionContext>,
-	state: InterpreterState,
-}
-
+/// A potentially unfinished function invocation.
 pub enum Invocation<'a, E: 'a + Externals> {
+	/// Function has thrown a host Trap and is waiting to be resumed.
 	Resumable(Resumable<'a, E>),
-	Done {
-		interpreter: Interpreter,
-		result: Result<Option<RuntimeValue>, Trap>,
-	},
+	/// Function has finished executing and a result availible.
+	Done(Done),
 }
 
 impl<'a, E: Externals> Invocation<'a, E> {
@@ -242,21 +214,21 @@ impl<'a, E: Externals> Invocation<'a, E> {
 				return_type,
 				externals,
 			}),
-			result => Invocation::Done { interpreter, result },
+			result => Invocation::Done(Done { interpreter, result }),
 		}
 	}
 
 	/// Clear data from interpreter and return it so it can be reused.
-	fn reset(self) -> Interpreter {
-		let mut interpreter = match self {
-			Invocation::Resumable(Resumable { interpreter, .. }) => interpreter,
-			Invocation::Done { interpreter, .. } => interpreter,
-		};
-		interpreter.reset();
-		interpreter
+	pub fn reset(self) -> Interpreter {
+		match self {
+			Invocation::Resumable(resumable) => resumable.reset(),
+			Invocation::Done(done) => done.reset(),
+		}
 	}
 }
 
+/// A suspended function execution. Execution may be resumed by calling ['Resumable::execute'] or
+/// ['Resumable::execute_resumable'].
 pub struct Resumable<'a, E: 'a + Externals> {
 	interpreter: Interpreter,
 	return_type: Option<ValueType>,
@@ -264,12 +236,86 @@ pub struct Resumable<'a, E: 'a + Externals> {
 }
 
 impl<'a, E: Externals> Resumable<'a, E> {
-	pub fn resume(mut self, requested_value: Option<RuntimeValue>) -> Invocation<'a, E> {
-		let result = self
-			.interpreter
-			.resume_execution(requested_value, self.externals, self.return_type);
+	// This function is private because it takes a reference
+	fn resume_private(&mut self, requested_value: Option<RuntimeValue>) -> Result<Option<RuntimeValue>, Trap> {
+		// push requested_value to interpreter value stack
+		if let Some(requested_value) = requested_value {
+			self.interpreter
+				.value_stack
+				.push(requested_value.into())
+				.map_err(Trap::new)?;
+		}
+
+		self.interpreter.run_interpreter_loop(self.externals)?;
+
+		let opt_return_value = self
+			.return_type
+			.map(|vt| self.interpreter.value_stack.pop().with_type(vt));
+
+		// Ensure that stack is empty after the execution. This is guaranteed by the validation properties.
+		assert!(self.interpreter.value_stack.len() == 0);
+
+		Ok(opt_return_value)
+	}
+
+	/// Continue function execution
+	pub fn execute(mut self, requested_value: Option<RuntimeValue>) -> Done {
+		let result = self.resume_private(requested_value);
+		Done {
+			interpreter: self.interpreter,
+			result,
+		}
+	}
+
+	/// Continue function execution, return [`Invocation::Done`] or [`Invocation::Resumable`]
+	pub fn execute_resumable(mut self, requested_value: Option<RuntimeValue>) -> Invocation<'a, E> {
+		let result = self.resume_private(requested_value);
 		Invocation::new(self.interpreter, result, self.return_type, self.externals)
 	}
+
+	/// Clear data from interpreter and return it so it can be reused.
+	pub fn reset(mut self) -> Interpreter {
+		self.interpreter.reset();
+		self.interpreter
+	}
+}
+
+/// A completed function execution.
+pub struct Done {
+	interpreter: Interpreter,
+	result: Result<Option<RuntimeValue>, Trap>,
+}
+
+impl Done {
+	/// Clear data from interpreter and return it so it can be reused.
+	///
+	/// ```
+	/// assert(false); // todo: write doctest
+	/// ```
+	pub fn reset(mut self) -> Interpreter {
+		self.interpreter.reset();
+		self.interpreter
+	}
+
+	// Returning an owned result would be more ergonomic, but Trap doesn't implement clone.
+	// reset_and_result is a workaround that allows the user to take ownership of both
+	// interpreter result.
+	/// Get the result of the execution.
+	pub fn result<'a>(&'a self) -> &'a Result<Option<RuntimeValue>, Trap> {
+		&self.result
+	}
+
+	/// Clear data from interpreter so it can be reused.
+	/// Return both the interpreter and the result as owned values.
+	pub fn reset_and_result(self) -> (Interpreter, Result<Option<RuntimeValue>, Trap>) {
+		(self.interpreter, self.result)
+	}
+}
+
+/// Function interpreter.
+pub struct Interpreter {
+	value_stack: ValueStack,
+	call_stack: StackWithLimit<FunctionContext>,
 }
 
 impl Interpreter {
@@ -316,7 +362,6 @@ impl Interpreter {
 		Interpreter {
 			value_stack: ValueStack(value_stack),
 			call_stack,
-			state: InterpreterState::Initialized,
 		}
 	}
 
@@ -324,12 +369,6 @@ impl Interpreter {
 	fn reset(&mut self) {
 		self.value_stack.truncate(0);
 		self.call_stack.truncate(0);
-		self.state = InterpreterState::Initialized;
-	}
-
-	/// Get current state of interpreter.
-	pub fn state(&self) -> &InterpreterState {
-		&self.state
 	}
 
 	/// Run func using this interpreter.
@@ -403,41 +442,12 @@ impl Interpreter {
 			.push(FunctionContext::new(func.clone()))
 			.map_err(|_| TrapKind::StackOverflow)?;
 
-		self.state = InterpreterState::Started;
 		self.run_interpreter_loop(externals)?;
 
 		let opt_return_value = func
 			.signature()
 			.return_type()
 			.map(|vt| self.value_stack.pop().with_type(vt));
-
-		// Ensure that stack is empty after the execution. This is guaranteed by the validation properties.
-		assert!(self.value_stack.len() == 0);
-
-		Ok(opt_return_value)
-	}
-
-	fn resume_execution<'a, E: Externals + 'a>(
-		&mut self,
-		expected_value: Option<RuntimeValue>,
-		externals: &'a mut E,
-		return_type: Option<ValueType>,
-	) -> Result<Option<RuntimeValue>, Trap> {
-		use core::mem::swap;
-
-		// Ensure that the VM is resumable. This is checked in `FuncInvocation::resume_execution`.
-		assert!(self.state.is_resumable());
-
-		let mut resumable_state = InterpreterState::Started;
-		swap(&mut self.state, &mut resumable_state);
-
-		if let Some(expected_value) = expected_value {
-			self.value_stack.push(expected_value.into()).map_err(Trap::new)?;
-		}
-
-		self.run_interpreter_loop(externals)?;
-
-		let opt_return_value = return_type.map(|vt| self.value_stack.pop().with_type(vt));
 
 		// Ensure that stack is empty after the execution. This is guaranteed by the validation properties.
 		assert!(self.value_stack.len() == 0);
@@ -485,20 +495,12 @@ impl Interpreter {
 							host_func_index,
 						} => {
 							let args = prepare_function_args(signature, &mut self.value_stack);
-							// We push the function context first. If the VM is not resumable, it does no harm. If it is, we then save the context here.
+							// We push the function context first. If the VM is not resumable, it
+							// does no harm. If it is, we then save the context here.
 							self.call_stack.push(function_context)?;
 
-							let return_val = match externals
-								.invoke_index(host_func_index, RuntimeArgs::from(args.as_ref()))
-							{
-								Ok(val) => val,
-								Err(trap) => {
-									if trap.kind().is_host() {
-										self.state = InterpreterState::Resumable(nested_func.signature().return_type());
-									}
-									return Err(trap);
-								}
-							};
+							let return_val =
+								externals.invoke_index(host_func_index, RuntimeArgs::from(args.as_ref()))?;
 
 							// Check if `return_val` matches the signature.
 							let value_ty = return_val.as_ref().map(|val| val.value_type());
@@ -1545,5 +1547,33 @@ impl From<StackOverflow> for TrapKind {
 impl From<StackOverflow> for Trap {
 	fn from(_: StackOverflow) -> Trap {
 		Trap::new(TrapKind::StackOverflow)
+	}
+}
+
+#[cfg(test)]
+mod test {
+	#[test]
+	fn invoke() {
+		assert!(false);
+	}
+
+	#[test]
+	fn resume() {
+		assert!(false);
+	}
+
+	#[test]
+	fn multi_resume() {
+		assert!(false); // run resume in a loop
+	}
+
+	#[test]
+	fn resume_reset() {
+		assert!(false);
+	}
+
+	#[test]
+	fn doctests_are_written() {
+		assert!(false);
 	}
 }

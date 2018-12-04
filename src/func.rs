@@ -2,14 +2,10 @@
 use alloc::prelude::*;
 use alloc::rc::{Rc, Weak};
 use core::fmt;
-use host::Externals;
 use isa;
 use module::ModuleInstance;
 use parity_wasm::elements::Local;
-use runner::{Interpreter, InterpreterState};
-use types::ValueType;
-use value::RuntimeValue;
-use {Signature, Trap};
+use Signature;
 
 /// Reference to a function (See [`FuncInstance`] for details).
 ///

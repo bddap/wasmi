@@ -189,14 +189,14 @@ impl Default for InterpreterStackConfig {
 }
 
 /// A potentially unfinished function invocation.
-pub enum Invocation<'a, E: 'a + Externals> {
+pub enum Invocation {
 	/// Function has thrown a host Trap and is waiting to be resumed.
-	Resumable(Resumable<'a, E>),
+	Resumable(Resumable),
 	/// Function has finished executing and a result availible.
 	Done(Done),
 }
 
-impl<'a, E: Externals> Invocation<'a, E> {
+impl Invocation {
 	// Initialize an Invocation based on an interpreter and the result of the interpreter's last
 	// invocation. Return type of the function at the bottom of the call stack must also be
 	// supplied. Externals must also be supplied.
@@ -204,7 +204,6 @@ impl<'a, E: Externals> Invocation<'a, E> {
 		interpreter: Interpreter,
 		result: Result<Option<RuntimeValue>, Trap>,
 		return_type: Option<ValueType>,
-		externals: &'a mut E,
 	) -> Self {
 		match result {
 			Err(Trap {
@@ -212,7 +211,6 @@ impl<'a, E: Externals> Invocation<'a, E> {
 			}) => Invocation::Resumable(Resumable {
 				interpreter,
 				return_type,
-				externals,
 			}),
 			result => Invocation::Done(Done { interpreter, result }),
 		}
@@ -229,15 +227,18 @@ impl<'a, E: Externals> Invocation<'a, E> {
 
 /// A suspended function execution. Execution may be resumed by calling ['Resumable::execute'] or
 /// ['Resumable::execute_resumable'].
-pub struct Resumable<'a, E: 'a + Externals> {
+pub struct Resumable {
 	interpreter: Interpreter,
 	return_type: Option<ValueType>,
-	externals: &'a mut E,
 }
 
-impl<'a, E: Externals> Resumable<'a, E> {
+impl Resumable {
 	// This function is private because it takes a reference
-	fn resume_private(&mut self, requested_value: Option<RuntimeValue>) -> Result<Option<RuntimeValue>, Trap> {
+	fn resume_private<E: Externals>(
+		&mut self,
+		requested_value: Option<RuntimeValue>,
+		env: &mut E,
+	) -> Result<Option<RuntimeValue>, Trap> {
 		// push requested_value to interpreter value stack
 		if let Some(requested_value) = requested_value {
 			self.interpreter
@@ -246,7 +247,7 @@ impl<'a, E: Externals> Resumable<'a, E> {
 				.map_err(Trap::new)?;
 		}
 
-		self.interpreter.run_interpreter_loop(self.externals)?;
+		self.interpreter.run_interpreter_loop(env)?;
 
 		let opt_return_value = self
 			.return_type
@@ -259,8 +260,8 @@ impl<'a, E: Externals> Resumable<'a, E> {
 	}
 
 	/// Continue function execution
-	pub fn execute(mut self, requested_value: Option<RuntimeValue>) -> Done {
-		let result = self.resume_private(requested_value);
+	pub fn execute<E: Externals>(mut self, requested_value: Option<RuntimeValue>, env: &mut E) -> Done {
+		let result = self.resume_private(requested_value, env);
 		Done {
 			interpreter: self.interpreter,
 			result,
@@ -268,9 +269,9 @@ impl<'a, E: Externals> Resumable<'a, E> {
 	}
 
 	/// Continue function execution, return [`Invocation::Done`] or [`Invocation::Resumable`]
-	pub fn execute_resumable(mut self, requested_value: Option<RuntimeValue>) -> Invocation<'a, E> {
-		let result = self.resume_private(requested_value);
-		Invocation::new(self.interpreter, result, self.return_type, self.externals)
+	pub fn execute_resumable<E: Externals>(mut self, requested_value: Option<RuntimeValue>, env: &mut E) -> Invocation {
+		let result = self.resume_private(requested_value, env);
+		Invocation::new(self.interpreter, result, self.return_type)
 	}
 
 	/// Clear data from interpreter and return it so it can be reused.
@@ -301,8 +302,8 @@ impl Done {
 	// reset_and_result is a workaround that allows the user to take ownership of both
 	// interpreter result.
 	/// Get the result of the execution.
-	pub fn result<'a>(&'a self) -> &'a Result<Option<RuntimeValue>, Trap> {
-		&self.result
+	pub fn result(self) -> Result<Option<RuntimeValue>, Trap> {
+		self.result
 	}
 
 	/// Clear data from interpreter so it can be reused.
@@ -414,14 +415,14 @@ impl Interpreter {
 	/// assert!(false); // update this documentation
 	/// assert!(false); // add doctest
 	/// ```
-	pub fn invoke_resumable<'a, E: Externals>(
+	pub fn invoke_resumable<E: Externals>(
 		mut self,
 		func: &FuncRef,
 		args: &[RuntimeValue],
-		externals: &'a mut E,
-	) -> Invocation<'a, E> {
+		externals: &mut E,
+	) -> Invocation {
 		let result = self.invoke(func, args, externals);
-		Invocation::new(self, result, func.signature().return_type(), externals)
+		Invocation::new(self, result, func.signature().return_type())
 	}
 
 	fn start_execution<E: Externals>(
@@ -1552,6 +1553,54 @@ impl From<StackOverflow> for Trap {
 
 #[cfg(test)]
 mod test {
+	use core::fmt;
+	use core::fmt::{Debug, Display, Formatter};
+	use core::iter::{Cycle, Iterator};
+	use core::slice;
+	use tests::parse_wat;
+
+	use {
+		Error, Externals, FuncInstance, FuncRef, HostError, ImportsBuilder, Interpreter, Invocation,
+		ModuleImportResolver, ModuleInstance, RuntimeArgs, RuntimeValue, Signature, Trap, TrapKind,
+	};
+
+	struct DebugHost<'a> {
+		script: Cycle<slice::Iter<'a, ScriptElement>>,
+		history: Vec<(usize, Box<[RuntimeValue]>)>,
+	}
+
+	enum ScriptElement {
+		Return(Option<RuntimeValue>),
+		HostTrap, // Trap doesn't implement clone, so we fake it
+	}
+
+	#[derive(Debug)]
+	struct Pause;
+	impl HostError for Pause {}
+	impl Display for Pause {
+		fn fmt(&self, fmt: &mut Formatter) -> Result<(), fmt::Error> {
+			Debug::fmt(self, fmt)
+		}
+	}
+
+	impl<'a> Externals for DebugHost<'a> {
+		fn invoke_index(&mut self, index: usize, args: RuntimeArgs) -> Result<Option<RuntimeValue>, Trap> {
+			self.history.push((index, args.as_ref().to_owned().into_boxed_slice()));
+			match self.script.next().unwrap() {
+				ScriptElement::Return(a) => Ok(*a),
+				ScriptElement::HostTrap => Err(Trap {
+					kind: TrapKind::Host(Box::new(Pause)),
+				}),
+			}
+		}
+	}
+
+	impl<'a> ModuleImportResolver for DebugHost<'a> {
+		fn resolve_func(&self, field_name: &str, signature: &Signature) -> Result<FuncRef, Error> {
+			Ok(FuncInstance::alloc_host(signature.clone(), 1))
+		}
+	}
+
 	#[test]
 	fn invoke() {
 		assert!(false);
@@ -1564,6 +1613,37 @@ mod test {
 
 	#[test]
 	fn multi_resume() {
+		let module = parse_wat(
+			r#"(module
+			(import "env" "trap_sub" (func $trap_sub (param i32 i32) (result i32)))
+
+				(func (export "test") (result i32)
+ 					(call $trap_sub
+						(i32.const 5)
+						(i32.const 7)
+					)
+				)
+			)"#,
+		);
+
+		let mut env = DebugHost {
+			history: Vec::new(),
+			script: [ScriptElement::Return(Some(RuntimeValue::I32(1)))].iter().cycle(),
+		};
+
+		let instance = ModuleInstance::new(&module, &ImportsBuilder::new().with_resolver("env", &env))
+			.expect("Failed to instantiate module")
+			.assert_no_start();
+
+		let export = instance.export_by_name("test").unwrap();
+		let func_instance = export.as_func().unwrap();
+
+		let invocation = Interpreter::new().invoke_resumable(&func_instance, &[], &mut env);
+		let resumable = match invocation {
+			Invocation::Resumable(resumable) => resumable,
+			Invocation::Done(_) => panic!(),
+		};
+
 		assert!(false); // run resume in a loop
 	}
 

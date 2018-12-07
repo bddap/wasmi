@@ -2,8 +2,8 @@ use super::parse_wat;
 use memory_units::Pages;
 use types::ValueType;
 use {
-	Error, Externals, FuncInstance, FuncRef, HostError, ImportsBuilder, MemoryDescriptor, MemoryInstance, MemoryRef,
-	ModuleImportResolver, ModuleInstance, ModuleRef, ResumableError, RuntimeArgs, RuntimeValue, Signature,
+	Error, Externals, FuncInstance, FuncRef, HostError, ImportsBuilder, Interpreter, Invocation, MemoryDescriptor,
+	MemoryInstance, MemoryRef, ModuleImportResolver, ModuleInstance, ModuleRef, RuntimeArgs, RuntimeValue, Signature,
 	TableDescriptor, TableInstance, TableRef, Trap, TrapKind,
 };
 
@@ -266,21 +266,20 @@ fn resume_call_host_func() {
 	let func_instance = export.as_func().unwrap();
 	let return_type = func_instance.signature().return_type();
 
-	let mut invocation = FuncInstance::invoke_resumable(&func_instance);
-	let result = invocation.start_execution(&mut env, func_instance, &[]);
-	match result {
-		Err(ResumableError::Trap(_)) => {}
-		_ => panic!(),
-	}
+	let invocation = Interpreter::new().invoke_resumable(&func_instance, &[], &mut env);
+	let resumable = match invocation {
+		Invocation::Resumable(resumable) => resumable,
+		Invocation::Done(_) => panic!(),
+	};
 
-	assert!(invocation.is_resumable());
 	let trap_sub_result = env.trap_sub_result.take();
-	assert_eq!(
-		invocation
-			.resume_execution(trap_sub_result, &mut env, return_type)
-			.expect("Failed to invoke 'test' function",),
-		Some(RuntimeValue::I32(-2))
-	);
+
+	let result = resumable
+		.execute(trap_sub_result, &mut env)
+		.result()
+		.expect("Failed to invoke 'test' function");
+
+	assert_eq!(result, Some(RuntimeValue::I32(-2)));
 }
 
 #[test]
